@@ -32,6 +32,7 @@ import java.io.IOException;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 
 import static apoc.util.BinaryTestUtil.fileToBinary;
@@ -170,34 +171,43 @@ public class ImportJsonTest {
             Assert.assertArrayEquals(expected, actual, 0.05D);
         }
     }
-    
+
     @Test
-    public void shouldTerminateImportWhenTransactionIsTimedOut() {
+    public void shouldTerminateImportWhenTransactionIsTimedOut()
+    {
+        createConstraints( List.of( "Stream", "User", "Game", "Team", "Language" ) );
+        final String query = "CALL apoc.import.json('https://devrel-data-science.s3.us-east-2.amazonaws.com/twitch_all.json')";
+        new Thread( () -> db.executeTransactionally( query ) ).start();
 
-        createConstraints(List.of("Stream", "User", "Game", "Team", "Language"));
+        // wait for the transaction running the 'apoc.import.json() query to be found and then cancel it.
+        assertEventually( () ->
+                          {
+                              var transactionId = getTransactionId( "CALL apoc.import.json" );
+                              if ( transactionId.isEmpty() )
+                              {
+                                  return false;
+                              }
+                              else
+                              {
+                                  return db.executeTransactionally( "TERMINATE TRANSACTION '" + transactionId.get() + "'",
+                                                                    map(),
+                                                                    result ->
+                                                                    {
+                                                                        final ResourceIterator<String> queryIterator = result.columnAs( "transactionId" );
+                                                                        return queryIterator.hasNext() && queryIterator.next().equals( transactionId.get() );
+                                                                    } );
+                              }
+                          }, ( value ) -> value, 10L, TimeUnit.SECONDS );
 
-        String filename = "https://devrel-data-science.s3.us-east-2.amazonaws.com/twitch_all.json";
-
-        final String query = "CALL apoc.import.json($file)";
-        new Thread(() -> db.executeTransactionally(query,  map("file", filename))).start();
-
-        // waiting for 'apoc.import.json() query to cancel when it is found
-        assertEventually(() -> db.executeTransactionally("call dbms.listQueries() YIELD query, queryId " +
-                        "WHERE query = $query WITH queryId as id CALL dbms.killQuery(id) YIELD queryId RETURN true",
-                map("query", query),
-                result -> {
-                    final ResourceIterator<Boolean> booleanIterator = result.columnAs("true");
-                    return booleanIterator.hasNext() && booleanIterator.next();
-                }), (value) -> value, 10L, TimeUnit.SECONDS);
-
-        // checking for query cancellation
-        assertEventually(() -> db.executeTransactionally("call dbms.listQueries",
-                map("query", query),
-                result -> {
-                    final ResourceIterator<String> queryIterator = result.columnAs("query");
-                    final String first = queryIterator.next();
-                    return first.equals("call dbms.listQueries") && !queryIterator.hasNext();
-                } ), (value) -> value, 10L, TimeUnit.SECONDS);
+        // checking for transaction termination by asserting that the only remaining transaction is the one running SHOW TRANSACTIONS itself
+        assertEventually( () -> db.executeTransactionally( "SHOW TRANSACTIONS",
+                                                           map(),
+                                                           result ->
+                                                           {
+                                                               final ResourceIterator<String> queryIterator = result.columnAs( "currentQuery" );
+                                                               final String first = queryIterator.next();
+                                                               return first.equals( "SHOW TRANSACTIONS" ) && !queryIterator.hasNext();
+                                                           } ), ( value ) -> value, 10L, TimeUnit.SECONDS );
     }
 
     @Test
@@ -269,6 +279,24 @@ public class ImportJsonTest {
                 (r) -> assertionsAllJsonProgressInfo(r, true));
 
         assertionsAllJsonDbResult();
+    }
+
+    private Optional<String> getTransactionId( String queryStem )
+    {
+        return db.executeTransactionally( "SHOW TRANSACTIONS WHERE currentQuery STARTS WITH '" + queryStem + "'",
+                                          map(),
+                                          result ->
+                                          {
+                                              ResourceIterator<String> iterator = result.columnAs( "transactionId" );
+                                              if ( iterator.hasNext() )
+                                              {
+                                                  return Optional.of( iterator.next() );
+                                              }
+                                              else
+                                              {
+                                                  return Optional.empty();
+                                              }
+                                          } );
     }
 
     private void assertionsAllJsonProgressInfo(Map<String, Object> r, boolean isBinary) {
